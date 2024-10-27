@@ -25,6 +25,19 @@ python examples/scripts/dpo_online.py \
     --warmup_ratio 0.1 \
     --missing_eos_penalty 1.0
 
+Using judge instead of using scalar reward model:
+export JUDGE_MODEL=pairrm    # use llm-blender/PairRM for preference feedback
+export JUDGE_MODEL=gpt-4o-mini-2024-07-18    # use OpenAI API for preference feedback
+python examples/scripts/dpo_online.py \
+    --model_name_or_path trl-lib/pythia-1b-deduped-tldr-sft  \
+    --judge_model_path $JUDGE_MODEL \
+    --dataset_name trl-lib/tldr \
+    --learning_rate 5.0e-7 \
+    --output_dir pythia-1b-tldr-online-dpo \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 32 \
+    --warmup_ratio 0.1
+
 With LoRA:
 python examples/scripts/dpo_online.py \
     --model_name_or_path trl-lib/pythia-1b-deduped-tldr-sft  \
@@ -54,7 +67,16 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
+from trl.trainer import judges
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+
+
+def parse_judge_model(judge_model_path: str):
+    if "pairrm" in judge_model_path.lower():
+        return judges.PairRMJudge()
+    if "gpt" in judge_model_path.lower():
+        return judges.OpenAIPairwiseJudge(judge_model_path)
+    return judges.HfPairwiseJudge(judge_model_path)
 
 
 if __name__ == "__main__":
@@ -81,11 +103,19 @@ if __name__ == "__main__":
         model_config.model_name_or_path, trust_remote_code=model_config.trust_remote_code, **model_kwargs
     )
 
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path,
-        num_labels=1,
-        trust_remote_code=model_config.trust_remote_code,
-        **model_kwargs,
+    reward_model = (
+        AutoModelForSequenceClassification.from_pretrained(
+            training_args.reward_model_path,
+            num_labels=1,
+            trust_remote_code=model_config.trust_remote_code,
+            **model_kwargs,
+        )
+        if training_args.reward_model_path is not None
+        else None
+    )
+
+    judge_model = (
+        parse_judge_model(training_args.judge_model_path) if training_args.judge_model_path is not None else None
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -104,6 +134,7 @@ if __name__ == "__main__":
     trainer = OnlineDPOTrainer(
         model=model,
         reward_model=reward_model,
+        judge=judge_model,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split],

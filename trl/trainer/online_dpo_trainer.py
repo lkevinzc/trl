@@ -19,6 +19,7 @@ from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import datasets
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -149,8 +150,6 @@ class OnlineDPOTrainer(Trainer):
             )
         elif reward_model is None and judge is None:
             raise ValueError("Either `reward_model` or `judge` must be provided.")
-        elif reward_model is None and judge is not None:
-            raise NotImplementedError("Using `judge` is not yet supported.")
 
         self.reward_model = reward_model
         self.judge = judge
@@ -367,6 +366,7 @@ class OnlineDPOTrainer(Trainer):
         batch_size = len(next(iter(inputs.values())))
         inputs = [{k: v[i] for k, v in inputs.items()} for i in range(batch_size)]
         inputs = [maybe_apply_chat_template(x, self.tokenizer) for x in inputs]
+        prompts = [x["prompt"] for x in inputs]
         inputs = [self.tokenize_row(x, self.model.config.is_encoder_decoder, self.tokenizer) for x in inputs]
         inputs = self.data_collator(inputs)
 
@@ -412,23 +412,33 @@ class OnlineDPOTrainer(Trainer):
             ref_logprobs = torch.take_along_dim(ref_all_logprobs, completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs  # free memory
 
-            # Get the reward from the reward model
-            _, scores, _ = get_reward(
-                self.reward_model, prompt_completion_ids, self.tokenizer.pad_token_id, context_length
-            )
-
         # Filter completion. Ensure that the sample contains stop_token_id
-        # Completions not passing that filter will receive a lower score.
+        # Completions not passing that filter will receive a lower score if using scalar reward model.
         contain_eos_token = torch.any(completion_ids == self.tokenizer.eos_token_id, dim=-1)
-        if self.args.missing_eos_penalty is not None:
-            scores[~contain_eos_token] -= self.args.missing_eos_penalty
+        if self.reward_model is not None:
+            with torch.no_grad():
+                # Get the reward from the reward model
+                _, scores, _ = get_reward(
+                    self.reward_model, prompt_completion_ids, self.tokenizer.pad_token_id, context_length
+                )
 
-        # Split the scores in 2 (the prompts of the first half are the same as the second half)
-        first_half, second_half = scores.split(num_examples)
+            if self.args.missing_eos_penalty is not None:
+                scores[~contain_eos_token] -= self.args.missing_eos_penalty
+
+            # Split the scores in 2 (the prompts of the first half are the same as the second half)
+            first_half, second_half = scores.split(num_examples)
+            mask = first_half >= second_half
+        elif self.judge is not None:
+            # Get the ranking from the judge
+            completions = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+            completions = [c.strip() for c in completions]  # 1d
+            completions = np.array(completions).reshape(2, -1).transpose(1, 0).tolist()
+            chosen = self.judge.judge(prompts, completions)
+            mask = torch.tensor(chosen, device=completion_ids.device) == 0
+            scores = torch.zeros((2 * num_examples,), device=completion_ids.device)  # dummy scores for logging purpose
 
         # Get the indices of the chosen and rejected examples
-        num_examples_range = torch.arange(num_examples, device=scores.device)
-        mask = first_half >= second_half
+        num_examples_range = torch.arange(num_examples, device=completion_ids.device)
         chosen_indices = num_examples_range + (~mask * num_examples)
         rejected_indices = num_examples_range + (mask * num_examples)
 

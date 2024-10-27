@@ -173,7 +173,7 @@ class PairRMJudge(BasePairwiseJudge):
             completions = [pair[::-1] if flip else pair for flip, pair in zip(flip_mask, completions)]
 
         # Rank the completions
-        ranks = self.blender.rank(prompts, completions)
+        ranks = self.blender.rank(prompts, completions, disable_tqdm=True)
         ranks -= 1  # PairRM is 1-indexed, so we subtract 1 to make it 0-indexed
 
         # Flip back the ranks to the original order if needed

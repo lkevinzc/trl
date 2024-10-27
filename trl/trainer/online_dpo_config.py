@@ -33,6 +33,8 @@ class OnlineDPOConfig(TrainingArguments):
             [`~transformers.TrainingArguments`].
         reward_model_path (`Optional[str]`, *optional*, defaults to `None`):
             Path to the reward model.
+        judge_model_path (`Optional[str]`, *optional*, defaults to `None`):
+            Path to the judge model.
         max_new_tokens (`int`, *optional*, defaults to `64`):
             Maximum number of tokens to generate per completion.
         temperature (`float`, *optional*, defaults to `0.9`):
@@ -60,6 +62,7 @@ class OnlineDPOConfig(TrainingArguments):
 
     learning_rate: float = 5e-7
     reward_model_path: Optional[str] = None
+    judge_model_path: Optional[str] = None
     max_new_tokens: int = 64
     temperature: float = 0.9
     missing_eos_penalty: Optional[float] = None
