@@ -59,7 +59,7 @@ from .utils import (
     prepare_deepspeed,
     truncate_right,
 )
-
+import torch.distributed as dist
 
 if is_peft_available():
     from peft import PeftModel, get_peft_model
@@ -81,6 +81,13 @@ if is_wandb_available():
 
 logger = logging.get_logger(__name__)
 
+import time
+
+def log_current_time(accelerator):
+    if accelerator.is_main_process:
+        return time.time()
+    else:
+        return None
 
 class OnlineDPOTrainer(Trainer):
     r"""
@@ -274,6 +281,8 @@ class OnlineDPOTrainer(Trainer):
             if self.reward_model is not None:
                 self.reward_model = self.reward_model.to(self.accelerator.device)
 
+        self.stamp = time.time()
+
     @property
     def beta(self):
         if isinstance(self._beta, list):
@@ -385,6 +394,10 @@ class OnlineDPOTrainer(Trainer):
         inputs = [self.tokenize_row(x, self.model.config.is_encoder_decoder, self.processing_class) for x in inputs]
         inputs = self.data_collator(inputs)
 
+        # --- Time the generation ---
+        torch.cuda.synchronize()
+        dist.barrier()
+        time_start = log_current_time(self.accelerator)
         # Sample 2 completions per prompt of size `max_new_tokens` from the model
         inputs = self._prepare_inputs(inputs)
         num_examples, context_length = inputs["prompt_input_ids"].shape
@@ -397,6 +410,12 @@ class OnlineDPOTrainer(Trainer):
                 generation_config=self.generation_config,
             )
         del inputs
+        torch.cuda.synchronize()
+        dist.barrier()
+        time_end = log_current_time(self.accelerator)
+        if time_start is not None and time_end is not None:
+            time_duration = time_end - time_start
+            print(f"%EB& [generation]: {time_duration:.8f} seconds")
 
         completion_ids = output[:, context_length:]
         completion_ids, completion_mask = truncate_right(
@@ -406,6 +425,10 @@ class OnlineDPOTrainer(Trainer):
         prompt_completion_ids = torch.cat((prompt_ids, completion_ids), dim=1)
         prompt_completion_mask = torch.cat((prompt_mask, completion_mask), dim=1)
 
+        # --- Time fw/bw pass ---
+        torch.cuda.synchronize()
+        dist.barrier()
+        core_time_start = log_current_time(self.accelerator)
         # Get the logprobs of the completions from the model
         output = model(prompt_completion_ids, attention_mask=prompt_completion_mask)
         # There is 1 offset, because the model predict the next token
@@ -428,6 +451,10 @@ class OnlineDPOTrainer(Trainer):
             ref_logprobs = torch.take_along_dim(ref_all_logprobs, completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs  # free memory
 
+        # --- Time rewarding ---
+        torch.cuda.synchronize()
+        dist.barrier()
+        start_time = log_current_time(self.accelerator)
         # Get the reward from the reward model or judge:
         if self.judge is not None:
             completions = self.processing_class.batch_decode(
@@ -465,6 +492,13 @@ class OnlineDPOTrainer(Trainer):
 
             # Get the indices of the chosen and rejected examples
             mask = first_half >= second_half
+
+        torch.cuda.synchronize()
+        dist.barrier()
+        end_time = log_current_time(self.accelerator)
+        if start_time is not None and end_time is not None:
+            time_duration = end_time - start_time
+            print(f"%EB& [rewarding]: {time_duration:.8f} seconds")
 
         num_examples_range = torch.arange(num_examples, device=prompt_completion_ids.device)
         chosen_indices = num_examples_range + (~mask * num_examples)
@@ -552,6 +586,20 @@ class OnlineDPOTrainer(Trainer):
         else:
             self.accelerator.backward(loss, **kwargs)
 
+        torch.cuda.synchronize()
+        dist.barrier()
+        core_time_end = log_current_time(self.accelerator)
+        if core_time_start is not None and core_time_end is not None:
+            time_duration = core_time_end - core_time_start
+            print(f"%EB& [core&rew]: {time_duration:.8f} seconds")
+
+        torch.cuda.synchronize()
+        dist.barrier()
+        now = log_current_time(self.accelerator)
+        if now:
+            time_duration = now - self.stamp
+            self.stamp = now
+            print(f"%EB& [total]: {time_duration:.8f} seconds")
         return loss.detach() / self.args.gradient_accumulation_steps
 
     # Same as Trainer.evaluate but log our metrics

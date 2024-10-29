@@ -58,9 +58,15 @@ from trl import (
     get_quantization_config,
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
+from trl.import_utils import is_transformers_greater_than
 
 
 JUDGES = {"pair_rm": PairRMJudge, "openai": OpenAIPairwiseJudge, "hf": HfPairwiseJudge}
+
+if is_transformers_greater_than("4.33.0"):
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+else:
+    from transformers.deepspeed import is_deepspeed_zero3_enabled
 
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, OnlineDPOConfig, ModelConfig))
@@ -85,6 +91,12 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(
         model_config.model_name_or_path, trust_remote_code=model_config.trust_remote_code, **model_kwargs
     )
+    if is_deepspeed_zero3_enabled():
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            model_config.model_name_or_path, trust_remote_code=model_config.trust_remote_code, **model_kwargs
+        )
+    else:
+        ref_model = None
 
     if training_args.reward_model_path is not None:
         reward_model = AutoModelForSequenceClassification.from_pretrained(
@@ -117,6 +129,7 @@ if __name__ == "__main__":
 
     trainer = OnlineDPOTrainer(
         model=model,
+        ref_model=ref_model,
         reward_model=reward_model,
         judge=judge,
         args=training_args,
